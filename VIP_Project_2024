@@ -1,0 +1,209 @@
+##Analyzing 16S rRNA genes sequences in R
+##Primer sequences were removed from the fastq files were using cutadapt prior to running DADA2.
+##How to run cutadapt is explained here: https://astrobiomike.github.io/amplicon/dada2_workflow_ex
+#Run this on commandline
+#Install cut adapt and use it to trim off the primer sequences
+conda activate base
+conda install -c bioconda cutadapt
+cutadapt --version
+##Run the cutdapt on the samples to trim off primer sequences##
+
+for sample in $(ls *_1.fastq | sed 's/_1.fastq//')
+do
+    echo "On sample: $sample"
+    
+    cutadapt -a ^CCTAYGGGRBGCASCAG...GGACTACNNGGGTATCTAAT \
+             -A ^ATTAGATACCCANNGTAGTCC...CTGGTGCGGCKGCTGCCAC \
+             -m 200 -M 300 --discard-untrimmed \
+             -o ${sample}_sub_R1_trimmed.fq.gz -p ${sample}_sub_R2_trimmed.fq.gz \
+             ${sample}_1.fastq ${sample}_2.fastq \
+             >> cutadapt_primer_trimming_stats.txt 2>&1
+
+done
+
+## DADA2
+library(dada2)
+library(ggplot2)
+path <-"/mmfs1/scratch/godson.aryee/Kaffi_data"
+list.files(path)
+fnFs <- sort(list.files(path,pattern="_1.fastq",full.names = TRUE))
+fnRs <- sort(list.files(path,pattern="_2.fastq",full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+F_quality <- plotQualityProfile(fnFs[1:10]) 
+F_quality
+ggsave("fnFs_plotQualityProfile_2.tiff")
+
+R_quality <- plotQualityProfile(fnRs[1:20]) 
+R_quality
+ggsave("fnRs_plotQualityProfile.tiff")
+
+## Make output folder for filted files 
+
+filt_path <-file.path("/mmfs1/scratch/godson.aryee/Kaffi_data/filtered")
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq"))
+## Filtering parameters used: 
+# Primers were removed with cutadapt 
+# Forward reads trimmed to 200 bp. Look at quality plot to confirm 
+# Reverse reads trimmed to 200 bp. Look at quality plot to confirm 
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(200,200), maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,compress=TRUE, multithread=TRUE)
+head(out)
+
+## Learning error rates
+## These commands are the error learning steps that distinguish between real biological sequences and noise. The errors are then plotted to determine how well the algorithm did.
+errF <- learnErrors(filtFs, multithread=FALSE)
+errR <- learnErrors(filtRs, multithread=FALSE)
+
+Forward_error <- plotErrors(errF, nominalQ=TRUE)
+Forward_error
+ggsave("Forward_error_plot.tiff")
+
+Rev_error <- plotErrors(errR, nominalQ=TRUE)
+Rev_error
+ggsave("Reverse_error_plot.tiff")
+
+## Dereplication and assigning sample names to the derep-class objects
+
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+## This step is where the so-called "sequence variants" are inferred
+dadaFs <- dada(derepFs, err=errF, multithread=FALSE)
+dadaRs <- dada(derepRs, err=errR, multithread=FALSE)
+dadaFs[[1]]
+
+## Merging of forward and reverse reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, trimOverhang=FALSE, minOverlap=75, verbose=TRUE)
+head(mergers)
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+table(nchar(getSequences(seqtab))) ## Take a look at the number of reads by length in bp. 
+
+##collapsing sequences that are nearly identical into a single sequence
+seqtab2<-collapseNoMismatch(seqtab, minOverlap = 230, orderBy = "abundance",identicalOnly = FALSE, vec = TRUE, verbose = FALSE)
+
+##remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+
+table(nchar(getSequences(seqtab.nochim))) ## Take a look at the number of reads by length in bp.
+
+## Asigning taxonomy with the Silva 138.1 prokaryotic SSU taxonomic training data formatted for DADA2
+
+taxa <- assignTaxonomy(seqtab.nochim,"/mmfs1/scratch/godson.aryee/Kaffi_data/silva_nr99_v138.1_wSpecies_train_set.fa.gz", multithread=TRUE)
+write.csv(taxa, file="Taxa_Kaffi_2024_16S.csv")
+write.csv(seqtab.nochim, file="Seqsnochim_Kaffi_2024_16S.csv")
+
+#Load required libraries
+library(phyloseq)
+library(data.table)
+library(dplyr)
+library(reshape)
+library(magrittr)
+library(vegan)
+
+##read in mapping file
+Metadata <- read.delim("Metafile.txt", header=T, row.names = 1)
+head(Metadata); dim(Metadata); class(Metadata)
+
+##read in taxonomy file
+taxa1 <- as.matrix( read.csv("Taxa_Kaffi_2024_16S.csv", header = T, row.names = 1))
+dim(taxa1); class(taxa1)
+
+taxa1.print <- taxa1 # Removing sequence rownames for display only
+rownames(taxa1.print) <- NULL
+head(taxa1.print)
+
+##read in sequence file
+seqtab.nochim1 <- as.matrix( read.csv("Seqsnochim_Kaffi_2024_16S.csv",  
+                                      row.names=1, header = T) )
+seqtab.nochim1[1:2,1:2]; dim(seqtab.nochim1); class(seqtab.nochim1)
+
+##create phyloseq object - ASV table
+ps1 <- phyloseq(otu_table(seqtab.nochim1, taxa_are_rows=FALSE), 
+                sample_data(Metadata), 
+                tax_table(taxa1))
+ps1
+
+##replace sequences with ASV numbers
+dna <- Biostrings::DNAStringSet(taxa_names(ps1))
+names(dna) <- taxa_names(ps1)
+ps1 <- merge_phyloseq(ps1, dna)
+taxa_names(ps1) <- paste0("ASV", seq(ntaxa(ps1)))
+ps1
+
+##Remove chloroplasts, mitochondria, eukaryota, and ASVs without a domain.
+PS_clean <- ps1 %>%
+  subset_taxa(Kingdom != "Eukaryota" & Kingdom != "NA" & Order   != "Chloroplast" & Family  != "Mitochondria" &             
+  Order   != "Chloroplast")                 
+
+##Summarizing the number of reads per sample
+Reads_per_sample = data.table(as(sample_data(PS_clean), "data.frame"),
+                 TotalReads = sample_sums(PS_clean), keep.rownames = TRUE)
+setnames(Reads_per_sample, "rn", "SampleID")
+write.csv(Reads_per_sample, file="Kaffi_Reads_per_sample.csv")
+
+
+#Remove samples with fewer than 1000 sequences
+ps_reads_1000 = prune_samples(sample_sums(PS_clean) > 1000, PS_clean)
+
+#Create genus level summaries				 
+ps_genus <- tax_glom(ps_reads_1000, taxrank = 'Genus',NArm = FALSE,bad_empty=c(NA, "", " ", "\t"))
+ps_genus_rel = transform_sample_counts(ps_genus, function(x) x/sum(x)*100)
+dat <- psmelt(ps_genus_rel)
+dat$Genus<- as.character(dat$Genus)
+genus_abundance <- aggregate(Abundance~Sample+Genus, dat, FUN=sum)
+genus_abundance <- cast(genus_abundance, Sample ~ Genus)
+
+
+# Make sure the columns to use for the merge are identical
+identical( sort(Metadata$Description), sort(genus_abundance$Sample))
+# [1] TRUE
+genus_abundance_with_metadata <-  merge(Metadata, genus_abundance, by.x = "Description", by.y = "Sample") 
+write.csv(genus_abundance_with_metadata, file="Genus_summary_with_metadata.csv")
+
+
+##Random subsampling to set number of sequences (with replacement). Make sure that sample.size is set to the value that corresponds to *your* dataset.
+set.seed(711) 
+ps1.rarefied = rarefy_even_depth(ps_reads_1000, rngseed=1, sample.size=57500, replace=T)
+
+##Calculate alpha diversity measures
+alpha_diversity_Kaffi<-estimate_richness(ps1.rarefied, measures=c("Observed", "InvSimpson","Shannon"))
+write.csv(alpha_diversity_Kaffi,file="Kaffi_dataset_alpha_div_57500.csv")
+
+#Calculate Bray-Curtis dissimilarities and create an non-metric multidimensional scaling (NMDS) ordination.If you want or need to do a PCoA ordination replace "NMDS" with "PCoA".
+B_C_dist=distance(ps1.rarefied, method = "bray")
+B_C_Ord=ordinate(ps1.rarefied, "NMDS", distance = B_C_dist)
+
+#Plotting the Bray-Curtis dissimilarities on a NMDS ordination plot.
+p <- plot_ordination(ps1.rarefied, B_C_Ord, color = "Sample_type", shape="Treatment")+ theme_classic(20) + geom_point(size = 5) + theme(text = element_text(size = 20)) +theme(axis.text=element_text(size=20))
+p
+
+
+##Analyzing only a subset of samples (e.g. Nasal samples)
+PS_rumenfluid <- subset_samples(ps_reads_1000, Sample_type == "Rumen")
+
+#PERMANOVA - this example assesses the effect of treatment on the rumen microbiota
+Rumenfluid.rarefied = rarefy_even_depth(PS_rumenfluid, sample.size=57500, replace=T)
+df = as(sample_data(Rumenfluid.rarefied), "data.frame")
+d = distance(Rumenfluid.rarefied, "bray")
+Rumen_adonis = adonis2(d ~ Treatment, permutations = 10000,df)
+Rumen_adonis
+
+#Maaslin2 is used to identify features (e.g. genera) that are associated with an experimental factor (e.g. treatment). 
+library(Maaslin2)
+input_data = read.table(file = "Kaffi_genera_40percent_of_samples.txt", header = TRUE, sep = "\t",row.names = 1,  stringsAsFactors = FALSE)
+input_metadata = read.table(file = "maaslin_mapping.txt", header = TRUE, sep = "\t",row.names = 1,stringsAsFactors = FALSE)
+
+fit_data <- Maaslin2(
+input_data, input_metadata, 'treatment',
+fixed_effects = c("Sample_type"),
+reference = c("Sample_type", "Rumenfluid"), 
+max_significance = 0.05,
+normalization = 'NONE',
+standardize = FALSE)
